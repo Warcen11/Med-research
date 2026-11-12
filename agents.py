@@ -9,6 +9,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from statistics import median
 from pathlib import Path
 from typing import Any
 
@@ -306,8 +307,15 @@ def trial_agent(query: str, limit: int,
         desc = p.get('descriptionModule') or {}
         conditions = (p.get('conditionsModule') or {}).get('conditions') or []
         intervention_items = (p.get('armsInterventionsModule') or {}).get('interventions') or []
-        interventions = ', '.join(_plain(value.get('name')) for value in intervention_items
-                                  if isinstance(value, dict) and value.get('name'))
+        intervention_details = [
+            {'name': _plain(value.get('name')), 'type': str(value.get('type') or '').upper()}
+            for value in intervention_items
+            if isinstance(value, dict) and _plain(value.get('name'))
+        ]
+        interventions = ', '.join(value['name'] for value in intervention_details)
+        design_info = design.get('designInfo') or {}
+        enrollment_info = design.get('enrollmentInfo') or {}
+        masking_info = design_info.get('maskingInfo') or {}
         nct = ident.get('nctId', '')
         raw_references = (p.get('referencesModule') or {}).get('references') or []
         references = []
@@ -327,11 +335,17 @@ def trial_agent(query: str, limit: int,
             'status': status.get('overallStatus', 'UNKNOWN'),
             'phase': ', '.join(design.get('phases') or []),
             'study_type': design.get('studyType') or '',
+            'allocation': design_info.get('allocation') or '',
+            'masking': masking_info.get('masking') or '',
+            'intervention_model': design_info.get('interventionModel') or '',
+            'enrollment': enrollment_info.get('count'),
+            'enrollment_type': enrollment_info.get('type') or '',
             'references': references,
             'start_date': (status.get('startDateStruct') or {}).get('date', ''),
             'first_posted_date': (status.get('studyFirstPostDateStruct') or {}).get('date', ''),
             'conditions': ', '.join(conditions),
             'interventions': interventions,
+            'intervention_details': intervention_details,
             'summary': _plain(desc.get('briefSummary')),
             'has_results': bool(item.get('hasResults')),
             'url': f'https://clinicaltrials.gov/study/{nct}' if nct else '',
@@ -427,6 +441,208 @@ def _build_matches(publications: list[dict], trials: list[dict]) -> tuple[list[d
     return list(direct.values()), list(background.values())
 
 
+# A control intervention is still retained in individual trial records. We
+# exclude only plainly labelled controls from the list of *research directions*.
+CONTROL_NAMES = {'placebo', 'sham', 'no intervention', 'standard care',
+                 'standard of care', 'usual care'}
+STUDY_TYPE_LABELS = {
+    'INTERVENTIONAL': 'Интервенционные',
+    'OBSERVATIONAL': 'Наблюдательные',
+    'EXPANDED_ACCESS': 'Расширенный доступ',
+}
+INTERVENTION_TYPE_LABELS = {
+    'DRUG': 'Лекарственный препарат', 'BIOLOGICAL': 'Биологический препарат',
+    'DEVICE': 'Устройство', 'BEHAVIORAL': 'Поведенческое вмешательство',
+    'PROCEDURE': 'Процедура', 'DIAGNOSTIC_TEST': 'Диагностический тест',
+    'DIETARY_SUPPLEMENT': 'Пищевая добавка', 'RADIATION': 'Облучение',
+    'GENETIC': 'Генетическое вмешательство', 'COMBINATION_PRODUCT': 'Комбинированное',
+    'OTHER': 'Другое',
+}
+
+
+def _intervention_items(trial: dict) -> list[dict]:
+    """Parse structured interventions, with a fallback for older reports."""
+    details = trial.get('intervention_details')
+    if isinstance(details, list):
+        return [item for item in details if isinstance(item, dict) and item.get('name')]
+    # Old cached reports had only a comma-separated display field. We cannot
+    # reliably recover type or names containing commas from that field.
+    return [{'name': x.strip(), 'type': ''}
+            for x in str(trial.get('interventions') or '').split(',') if x.strip()]
+
+
+def _is_control(name: str) -> bool:
+    normalized = ' '.join(name.casefold().split())
+    return normalized in CONTROL_NAMES or normalized.startswith(('placebo ', 'sham '))
+
+
+def research_analysis(trials: list[dict], matches: list[dict] | None = None) -> dict:
+    """Deterministic descriptive analysis of retrieved ClinicalTrials.gov records.
+
+    Not a causal analysis, treatment recommendation or risk-of-bias assessment.
+    One multi-intervention study may contribute to several method categories.
+    """
+    methods: dict[str, dict] = {}
+    study_types = Counter()
+    intervention_types = Counter()
+    allocation_counts = Counter()
+    masking_counts = Counter()
+    enrollments: list[int] = []
+    actual_enrollments: list[int] = []
+    n_interventional = 0
+    n_completed = 0
+    results_in_registry = 0
+    result_reference_trials = 0
+    evidence_counts = Counter({
+        'Реестр и ссылка на публикацию результатов': 0,
+        'Только результаты в реестре': 0,
+        'Только ссылка на публикацию результатов': 0,
+        'Ни того ни другого не обнаружено': 0,
+    })
+    per_trial = []
+    matched_result_pubs = []
+    matched_result_trial_ids = set()
+    allowed_ids = {t.get('nct_id') for t in trials if t.get('nct_id')}
+    seen_match_keys = set()
+    for match in matches or []:
+        nct = match.get('nct_id')
+        match_methods = match.get('methods') or []
+        if nct not in allowed_ids or not any('PMID в реестре (RESULT)' in m for m in match_methods):
+            continue
+        match_key = (nct, match.get('pmid') or match.get('publication_url'))
+        if match_key in seen_match_keys:
+            continue
+        seen_match_keys.add(match_key)
+        matched_result_trial_ids.add(nct)
+        matched_result_pubs.append({
+            'nct_id': nct,
+            'publication_title': match.get('publication_title', ''),
+            'pmid': match.get('pmid', ''),
+            'publication_url': match.get('publication_url', ''),
+            'trial_url': match.get('trial_url', ''),
+        })
+
+    for trial in trials:
+        study_type = str(trial.get('study_type') or '').upper()
+        study_types[STUDY_TYPE_LABELS.get(study_type, 'Не указан')] += 1
+        if trial.get('status') == 'COMPLETED':
+            n_completed += 1
+        seen_names = set()
+        seen_types = set()
+        for item in _intervention_items(trial):
+            name = _plain(item.get('name'))
+            if not name:
+                continue
+            item_type = str(item.get('type') or '').upper()
+            if item_type not in seen_types and item_type:
+                intervention_types[INTERVENTION_TYPE_LABELS.get(item_type, item_type)] += 1
+                seen_types.add(item_type)
+            if _is_control(name):
+                continue
+            canonical = ' '.join(name.casefold().split())
+            if canonical in seen_names:
+                continue
+            seen_names.add(canonical)
+            if canonical not in methods:
+                methods[canonical] = {'name': name, 'type': INTERVENTION_TYPE_LABELS.get(item_type, item_type or 'Не указан'),
+                                      'count': 0, 'nct_ids': []}
+            methods[canonical]['count'] += 1
+            if trial.get('nct_id'):
+                methods[canonical]['nct_ids'].append(trial['nct_id'])
+
+        if study_type == 'INTERVENTIONAL':
+            n_interventional += 1
+            allocation = str(trial.get('allocation') or '').upper()
+            allocation_counts[{
+                'RANDOMIZED': 'Рандомизировано',
+                'NON_RANDOMIZED': 'Без рандомизации',
+                'NA': 'Не применяется',
+            }.get(allocation, 'Не указано')] += 1
+            masking = str(trial.get('masking') or '').upper()
+            masking_counts[{
+                'NONE': 'Без ослепления',
+                'SINGLE': 'Одинарное', 'DOUBLE': 'Двойное',
+                'TRIPLE': 'Тройное', 'QUADRUPLE': 'Четверное',
+            }.get(masking, 'Не указано')] += 1
+
+        enrollment = trial.get('enrollment')
+        # A bool must not be interpreted as a participant count.
+        if isinstance(enrollment, int) and not isinstance(enrollment, bool) and enrollment >= 0:
+            enrollments.append(enrollment)
+            if str(trial.get('enrollment_type') or '').upper() == 'ACTUAL':
+                actual_enrollments.append(enrollment)
+
+        in_registry = bool(trial.get('has_results'))
+        has_result_reference = any(
+            str(ref.get('type') or '').upper() == 'RESULT' and str(ref.get('pmid') or '').isdigit()
+            for ref in (trial.get('references') or []) if isinstance(ref, dict)
+        )
+        results_in_registry += in_registry
+        result_reference_trials += has_result_reference
+        if in_registry and has_result_reference:
+            group = 'Реестр и ссылка на публикацию результатов'
+        elif in_registry:
+            group = 'Только результаты в реестре'
+        elif has_result_reference:
+            group = 'Только ссылка на публикацию результатов'
+        else:
+            group = 'Ни того ни другого не обнаружено'
+        evidence_counts[group] += 1
+        per_trial.append({
+            'nct_id': trial.get('nct_id', ''), 'title': trial.get('title', ''),
+            'study_type': STUDY_TYPE_LABELS.get(study_type, 'Не указан'),
+            'allocation': str(trial.get('allocation') or 'Не указано'),
+            'masking': str(trial.get('masking') or 'Не указано'),
+            'enrollment': enrollment if isinstance(enrollment, int) and not isinstance(enrollment, bool) else None,
+            'enrollment_type': trial.get('enrollment_type') or '',
+            'registry_results': in_registry,
+            'result_reference': has_result_reference,
+            'evidence_group': group,
+            'url': trial.get('url', ''),
+        })
+
+    methods_ranked = sorted(methods.values(), key=lambda x: (-x['count'], x['name'].casefold()))
+    count = len(trials)
+    observations = []
+    if not count:
+        observations.append('В выбранной выдаче нет клинических испытаний для анализа.')
+    else:
+        observations.append(f'Проанализировано {count} загруженных испытаний; {n_completed} завершены.')
+        if methods_ranked:
+            top = methods_ranked[0]
+            observations.append(f'Чаще других среди указанных вмешательств встречается «{top["name"]}» '
+                                f'({top["count"]} из {count} записей). Это частота в выборке, не оценка эффективности.')
+        if n_interventional:
+            randomized = allocation_counts.get('Рандомизировано', 0)
+            observations.append(f'Рандомизация указана для {randomized} из {n_interventional} '
+                                'интервенционных испытаний; отсутствие записи не равнозначно отсутствию рандомизации.')
+        observations.append(f'Результаты в реестре доступны у {results_in_registry} из {count} испытаний; '
+                            f'ссылка типа RESULT с PMID указана у {result_reference_trials}.')
+        if count < 10:
+            observations.append('Выборка небольшая: её характеристики нельзя переносить на все исследования по теме.')
+
+    return {
+        'total': count,
+        'study_type_counts': dict(study_types.most_common()),
+        'intervention_type_counts': dict(intervention_types.most_common()),
+        'interventions': methods_ranked,
+        'n_interventional': n_interventional,
+        'allocation_counts': dict(allocation_counts.most_common()),
+        'masking_counts': dict(masking_counts.most_common()),
+        'enrollment_reported': len(enrollments),
+        'enrollment_actual_reported': len(actual_enrollments),
+        'enrollment_median': median(enrollments) if enrollments else None,
+        'enrollment_actual_median': median(actual_enrollments) if actual_enrollments else None,
+        'evidence_counts': dict(evidence_counts),
+        'results_in_registry': results_in_registry,
+        'result_reference_trials': result_reference_trials,
+        'confirmed_result_links': matched_result_pubs,
+        'confirmed_result_trial_count': len(matched_result_trial_ids),
+        'trial_details': per_trial,
+        'observations': observations,
+    }
+
+
 def analysis_agent(query: str, publications: list[dict], trials: list[dict],
                    errors: dict[str, str], source_info: dict | None = None,
                    related_publications: list[dict] | None = None) -> dict:
@@ -469,6 +685,7 @@ def analysis_agent(query: str, publications: list[dict], trials: list[dict],
         'phase_counts': dict(phase_counts.most_common()),
         'matches': matches,
         'background_matches': background_matches,
+        'research_analysis': research_analysis(trials, matches),
         'related_publications': related_publications,
         'highlights': highlights,
         'publications': publications,
@@ -482,6 +699,11 @@ def analysis_agent(query: str, publications: list[dict], trials: list[dict],
             'Упоминание NCT ID в статье не доказывает, что она сообщает результаты именно этого испытания.',
             'Наличие испытания или опубликованной статьи не доказывает эффективность или безопасность лечения.',
             'Флаг «есть результаты» означает наличие данных в ClinicalTrials.gov, а не наличие публикаций где-либо ещё.',
+            'Анализ вмешательств и дизайна — описательный; не является оценкой риска систематической ошибки или эффективности лечения.',
+            'Название вмешательства сопоставляется по написанию без учёта регистра; синонимы одного препарата могут учитываться отдельно.',
+            'Ссылки типа RESULT в реестре и структурированные результаты — разные показатели; отсутствие обоих не доказывает отсутствие результатов где-либо ещё.',
+            'Подтверждённые связи с публикациями результатов учитываются только при успешном сопоставлении PMID с записями Europe PMC из этой загрузки.',
+            'Количество участников может быть фактическим или плановым: эти значения не суммируются, медиана носит описательный характер.',
         ],
     }
 

@@ -5,7 +5,7 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from agents import coordinator, STATUS_LABELS
+from agents import coordinator, research_analysis, STATUS_LABELS
 
 PUBLICATION_TYPES = {
     'all': 'Все публикации',
@@ -32,7 +32,6 @@ RESULT_OPTIONS = {
 st.set_page_config(page_title='Medical Research Explorer', page_icon='🔬', layout='wide')
 st.title('🔬 Medical Research Explorer')
 st.caption('Мультиагентный поиск публикаций, клинических испытаний и связей между ними')
-st.info('Учебный аналитический проект, не медицинские рекомендации. Все выводы относятся к загруженной выборке.')
 
 with st.sidebar:
     st.header('Параметры поиска')
@@ -152,8 +151,9 @@ c4.metric('С результатами в реестре', counts['trials_with_r
 c5.metric('Связи по ID', len(report['matches']))
 st.caption('Счётчики — только по загруженным записям. Дополнительно найденные публикации в основной счётчик не входят.')
 
-pub_tab, trial_tab, analytics_tab, report_tab = st.tabs(
-    ['📄 Публикации', '🧪 Испытания', '📊 Аналитика', '📥 Отчёт'])
+pub_tab, trial_tab, analytics_tab, research_tab, report_tab = st.tabs(
+    ['📄 Публикации', '🧪 Испытания', '📊 Аналитика',
+     '🔬 Исследовательский анализ', '📥 Отчёт'])
 
 with pub_tab:
     pubs = report['publications']
@@ -261,6 +261,149 @@ with analytics_tab:
                 hide_index=True, use_container_width=True,
                 column_config={'publication_url': st.column_config.LinkColumn('Открыть')})
 
+with research_tab:
+    st.markdown('### Исследовательский анализ клинических испытаний')
+    st.caption('Используются поля найденных записей ClinicalTrials.gov. '
+               'Дополнительных запросов и экспертной оценки эффективности не выполняется.')
+    full_analysis = report.get('research_analysis') or research_analysis(report['trials'])
+
+    if not report['trials']:
+        st.info('Для исследовательского анализа нужны записи об испытаниях. '
+                'Проверьте запрос и выбранные фильтры.')
+    else:
+        st.markdown('#### 1. Какие методы и препараты изучают')
+        methods = full_analysis['interventions']
+        if methods:
+            method_df = pd.DataFrame([
+                {'Вмешательство': item['name'], 'Тип': item['type'],
+                 'Испытаний': item['count']}
+                for item in methods[:20]
+            ])
+            st.dataframe(method_df, hide_index=True, use_container_width=True)
+            st.caption('Одно испытание может изучать несколько вмешательств. '
+                       'Явно обозначенные placebo/sham и стандартный уход исключены из этого рейтинга, '
+                       'но сохранены в исходных записях. Синонимы препаратов не объединяются автоматически.')
+            options = [''] + list(range(len(methods)))
+            selected = st.selectbox(
+                'Анализ конкретного препарата или метода', options,
+                format_func=lambda x: ('Все найденные испытания' if x == '' else
+                                       f'{methods[x]["name"]} — {methods[x]["count"]} испытаний'),
+                key=f'research_method_choice_{report["collected_at_utc"]}',
+            )
+            if selected == '':
+                selected_trials = report['trials']
+            else:
+                ids = set(methods[selected]['nct_ids'])
+                selected_trials = [trial for trial in report['trials']
+                                   if trial.get('nct_id') in ids]
+            chosen_ids = {t.get('nct_id') for t in selected_trials}
+            analysis = research_analysis(selected_trials, [
+                match for match in report['matches'] if match.get('nct_id') in chosen_ids
+            ])
+        else:
+            st.info('В загруженных испытаниях нет названий вмешательств, '
+                    'подходящих для группировки. Остальная аналитика доступна ниже.')
+            analysis = full_analysis
+            selected_trials = report['trials']
+
+        st.divider()
+        st.markdown('#### 2. Методология и масштаб')
+        st.caption('Показатели дизайна относятся к интервенционным испытаниям. '
+                   'Незаполненное поле не трактуется как отсутствие соответствующего метода.')
+        design = analysis
+        num_interventional = design['n_interventional']
+        randomized = design['allocation_counts'].get('Рандомизировано', 0)
+        masked = sum(n for k, n in design['masking_counts'].items()
+                     if k not in ('Без ослепления', 'Не указано'))
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric('В выборке', design['total'])
+        m2.metric('Интервенционные', num_interventional)
+        m3.metric('Рандомизированные', f'{randomized}/{num_interventional}')
+        m4.metric('С ослеплением', f'{masked}/{num_interventional}')
+
+        p1, p2 = st.columns(2)
+        with p1:
+            st.markdown('**Рандомизация**')
+            if design['allocation_counts']:
+                st.dataframe(pd.DataFrame([
+                    {'Категория': k, 'Испытаний': v}
+                    for k, v in design['allocation_counts'].items()
+                ]), hide_index=True, use_container_width=True)
+            else:
+                st.info('Нет интервенционных испытаний.')
+        with p2:
+            st.markdown('**Ослепление**')
+            if design['masking_counts']:
+                st.dataframe(pd.DataFrame([
+                    {'Категория': k, 'Испытаний': v}
+                    for k, v in design['masking_counts'].items()
+                ]), hide_index=True, use_container_width=True)
+            else:
+                st.info('Нет интервенционных испытаний.')
+
+        reported = design['enrollment_reported']
+        actual_reported = design['enrollment_actual_reported']
+        st.write('**Количество участников:** медиана по записям с указанной численностью — '
+                 f'**{design["enrollment_median"]:g}** '
+                 if design['enrollment_median'] is not None else
+                 '**Количество участников:** данные в выборке не указаны.')
+        if reported:
+            st.caption(f'Численность указана в {reported} из {design["total"]} записей. '
+                       f'У {actual_reported} она помечена как фактическая, '
+                       'у остальных может быть запланированной. '
+                       'Медиана по всей выборке смешивает эти типы и приведена для справки.')
+            if design['enrollment_actual_median'] is not None:
+                st.caption('Медиана только фактической численности: '
+                           f'{design["enrollment_actual_median"]:g} участников.')
+
+        st.divider()
+        st.markdown('#### 3. Доступность результатов исследований')
+        e1, e2, e3 = st.columns(3)
+        e1.metric('Результаты в реестре', design['results_in_registry'])
+        e2.metric('Ссылки RESULT в реестре', design['result_reference_trials'])
+        e3.metric('Связано с Europe PMC по PMID', design['confirmed_result_trial_count'])
+        evidence = design['evidence_counts']
+        evidence_df = pd.DataFrame([
+            {'Категория': label, 'Испытаний': amount}
+            for label, amount in evidence.items()
+        ])
+        st.dataframe(evidence_df, hide_index=True, use_container_width=True)
+        st.caption('RESULT — тип ссылки, указанный в записи ClinicalTrials.gov. '
+                   'Совпадение с Europe PMC по PMID подтверждает наличие связанной статьи, '
+                   'но не её медицинские выводы. Отсутствие результатов и ссылок в реестре '
+                   'не доказывает отсутствия публикаций вообще.')
+        if design['confirmed_result_links']:
+            with st.expander('Связанные публикации результатов в Europe PMC'):
+                st.dataframe(pd.DataFrame(design['confirmed_result_links']),
+                             hide_index=True, use_container_width=True,
+                             column_config={
+                                 'publication_url': st.column_config.LinkColumn('Публикация'),
+                                 'trial_url': st.column_config.LinkColumn('Испытание'),
+                             })
+
+        with st.expander('Проверить данные по каждому испытанию'):
+            detail_rows = design['trial_details']
+            if detail_rows:
+                st.dataframe(pd.DataFrame(detail_rows)[[
+                    'nct_id', 'title', 'study_type', 'allocation', 'masking',
+                    'enrollment', 'enrollment_type', 'registry_results',
+                    'result_reference', 'url'
+                ]], hide_index=True, use_container_width=True,
+                    column_config={
+                        'registry_results': 'Результаты в реестре',
+                        'result_reference': 'Ссылка RESULT',
+                        'url': st.column_config.LinkColumn('Открыть исследование'),
+                    })
+            else:
+                st.info('Для выбранного вмешательства записей нет.')
+
+        st.divider()
+        st.markdown('#### 4. Автоматические наблюдения')
+        for observation in design['observations']:
+            st.markdown('- ' + observation)
+        st.caption('Это алгоритмическая сводка метаданных, а не медицинский вывод. '
+                   'Доли и частоты относятся исключительно к загруженной выборке.')
+
 with report_tab:
     st.markdown('### Сводный отчёт агента-аналитика')
     st.write(f'**Тема:** {report["query"]}')
@@ -272,6 +415,9 @@ with report_tab:
         st.write('**Дополнительные фильтры:** ' + '; '.join(active_filters))
     st.write('**Краткая сводка по найденным записям:**')
     for line in report.get('highlights', []):
+        st.write('•', line)
+    st.markdown('**Исследовательские наблюдения:**')
+    for line in (report.get('research_analysis') or research_analysis(report['trials']))['observations']:
         st.write('•', line)
     if report.get('related_publications'):
         st.write(f'Дополнительно получено **{len(report["related_publications"])}** публикаций '
