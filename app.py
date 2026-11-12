@@ -5,11 +5,34 @@ from datetime import date
 import pandas as pd
 import streamlit as st
 
-from agents import coordinator
+from agents import coordinator, STATUS_LABELS
+
+PUBLICATION_TYPES = {
+    'all': 'Все публикации',
+    'review': 'Обзоры (review)',
+    'clinical_trial': 'Клинические испытания (статьи)',
+    'randomized_trial': 'Рандомизированные испытания (RCT)',
+    'meta_analysis': 'Метаанализы',
+}
+PHASE_NAMES = {
+    '': 'Любая фаза',
+    'EARLY_PHASE1': 'Ранняя I',
+    'PHASE1': 'I',
+    'PHASE2': 'II',
+    'PHASE3': 'III',
+    'PHASE4': 'IV',
+    'NA': 'Не применяется',
+}
+RESULT_OPTIONS = {
+    'all': 'Любое наличие',
+    'with': 'Только с результатами в реестре',
+    'without': 'Только без результатов в реестре',
+}
 
 st.set_page_config(page_title='Medical Research Explorer', page_icon='🔬', layout='wide')
 st.title('🔬 Medical Research Explorer')
 st.caption('Мультиагентный поиск публикаций, клинических испытаний и связей между ними')
+st.info('Учебный аналитический проект, не медицинские рекомендации. Все выводы относятся к загруженной выборке.')
 
 with st.sidebar:
     st.header('Параметры поиска')
@@ -29,6 +52,37 @@ with st.sidebar:
         if trial_date_mode == 'Первая публикация в реестре':
             trial_date_field = 'StudyFirstPostDate'
         st.caption('Europe PMC: дата первой публикации статьи. ClinicalTrials.gov: выбранная дата исследования.')
+    with st.expander('🔎 Расширенный поиск', expanded=True):
+        intervention = st.text_input(
+            'Препарат или метод лечения (необязательно)',
+            placeholder='Например: donanemab, cognitive therapy',
+            help='В Europe PMC уточняет текстовый поиск, в ClinicalTrials.gov — поле вмешательства.',
+        )
+        publication_type = st.selectbox(
+            'Тип научной публикации · Europe PMC',
+            options=list(PUBLICATION_TYPES),
+            format_func=lambda key: PUBLICATION_TYPES[key],
+        )
+        trial_status = st.selectbox(
+            'Статус испытания · ClinicalTrials.gov',
+            options=[''] + [
+                'COMPLETED', 'RECRUITING', 'NOT_YET_RECRUITING',
+                'ACTIVE_NOT_RECRUITING', 'TERMINATED', 'SUSPENDED', 'WITHDRAWN',
+            ],
+            format_func=lambda key: STATUS_LABELS.get(key, key) if key else 'Любой статус',
+        )
+        trial_phase = st.selectbox(
+            'Фаза испытания · ClinicalTrials.gov',
+            options=list(PHASE_NAMES),
+            format_func=lambda key: PHASE_NAMES[key],
+        )
+        results_filter = st.selectbox(
+            'Опубликованные результаты · ClinicalTrials.gov',
+            options=list(RESULT_OPTIONS),
+            format_func=lambda key: RESULT_OPTIONS[key],
+        )
+        st.caption('Фильтры действуют на API до ограничения числа записей. '
+                   'Статус, фаза и результаты относятся только к испытаниям.')
     search = st.button('🔎 Запустить агентов', type='primary', use_container_width=True)
     st.divider()
     st.markdown('**Источники**')
@@ -42,9 +96,15 @@ if search:
         st.error('Дата «С» не может быть позже даты «По».')
     else:
         with st.spinner('Агенты собирают данные, проверяют ссылки и готовят отчёт…'):
-            st.session_state['report'] = coordinator(
-                query, limit, start_date, end_date, trial_date_field,
-            )
+            try:
+                st.session_state['report'] = coordinator(
+                    query, limit, start_date, end_date, trial_date_field,
+                    intervention=intervention, trial_status=trial_status,
+                    trial_phase=trial_phase, results_filter=results_filter,
+                    publication_type=publication_type,
+                )
+            except ValueError as exc:
+                st.error(str(exc))
 
 if 'report' not in st.session_state:
     st.markdown('### Как начать')
@@ -63,6 +123,20 @@ if filters.get('start_date'):
                f'статьи по дате публикации, испытания по {trial_date_label}.')
 else:
     st.caption('Поиск без ограничений по датам.')
+
+active_filters = []
+if filters.get('intervention'):
+    active_filters.append('Препарат/метод: ' + filters['intervention'])
+if filters.get('publication_type', 'all') != 'all':
+    active_filters.append('Публикации: ' + PUBLICATION_TYPES.get(filters['publication_type'], filters['publication_type']))
+if filters.get('trial_status'):
+    active_filters.append('Статус: ' + STATUS_LABELS.get(filters['trial_status'], filters['trial_status']))
+if filters.get('trial_phase'):
+    active_filters.append('Фаза: ' + PHASE_NAMES.get(filters['trial_phase'], filters['trial_phase']))
+if filters.get('results_filter', 'all') != 'all':
+    active_filters.append('Результаты: ' + RESULT_OPTIONS.get(filters['results_filter'], filters['results_filter']))
+if active_filters:
+    st.caption('Активные фильтры: ' + ' · '.join(active_filters))
 
 for source, error in report['errors'].items():
     st.error(f'{source}: {error} Результаты остальных источников сохранены.')
@@ -101,7 +175,9 @@ with trial_tab:
     trials = report['trials']
     if trials:
         df = pd.DataFrame(trials)
-        st.dataframe(df[['nct_id', 'title', 'status', 'phase', 'start_date',
+        if 'interventions' not in df:  # support viewing an older report in session state
+            df['interventions'] = ''
+        st.dataframe(df[['nct_id', 'title', 'status', 'phase', 'interventions', 'start_date',
                          'first_posted_date', 'has_results', 'url']],
                      use_container_width=True, hide_index=True,
                      column_config={'url': st.column_config.LinkColumn('Открыть'),
@@ -111,6 +187,7 @@ with trial_tab:
         trial = trials[selected]
         st.write(trial.get('summary') or 'Описание отсутствует.')
         st.write('Заболевания:', trial.get('conditions') or 'не указаны')
+        st.write('Вмешательства:', trial.get('interventions') or 'не указаны')
         references = trial.get('references') or []
         if references:
             with st.expander(f'Публикации, указанные в реестре ({len(references)})'):
@@ -191,6 +268,8 @@ with report_tab:
         st.write(f'**Период поиска:** {filters["start_date"]} — {filters["end_date"]}')
     else:
         st.write('**Период поиска:** без ограничений')
+    if active_filters:
+        st.write('**Дополнительные фильтры:** ' + '; '.join(active_filters))
     st.write('**Краткая сводка по найденным записям:**')
     for line in report.get('highlights', []):
         st.write('•', line)

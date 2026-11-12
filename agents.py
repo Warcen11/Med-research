@@ -22,6 +22,31 @@ NCT_PATTERN = re.compile(r'\bNCT\d{8}\b', re.IGNORECASE)
 CACHE_DIR = Path(__file__).resolve().parent / '.cache'
 CACHE_MAX_AGE = timedelta(days=14)
 TRIAL_DATE_FIELDS = {'StartDate', 'StudyFirstPostDate'}
+# The keys are internal UI values. API clauses are fixed/whitelisted, not user-built.
+PUBLICATION_TYPE_QUERIES = {
+    'all': '',
+    'review': 'PUB_TYPE:review',
+    'clinical_trial': 'PUB_TYPE:"clinical trial"',
+    'randomized_trial': 'PUB_TYPE:"randomized controlled trial"',
+    'meta_analysis': 'PUB_TYPE:"meta-analysis"',
+}
+TRIAL_PHASES = {'EARLY_PHASE1', 'PHASE1', 'PHASE2', 'PHASE3', 'PHASE4', 'NA'}
+TRIAL_STATUSES = {
+    'COMPLETED', 'RECRUITING', 'NOT_YET_RECRUITING', 'ACTIVE_NOT_RECRUITING',
+    'ENROLLING_BY_INVITATION', 'TERMINATED', 'SUSPENDED', 'WITHDRAWN', 'UNKNOWN',
+    'AVAILABLE', 'NO_LONGER_AVAILABLE', 'APPROVED_FOR_MARKETING', 'WITHHELD',
+}
+RESULTS_FILTERS = {'all', 'with', 'without'}
+
+
+def _intervention_phrase(value: str) -> str:
+    """A quoted literal term, so drug names cannot turn into query operators."""
+    term = ' '.join(value.split())
+    if len(term) > 150 or any(c in term for c in ('\"', '\\')):
+        raise ValueError('Укажите название препарата без кавычек или обратных слэшей (до 150 символов).')
+    return f'"{term}"' if term else ''
+
+
 
 
 def _normalize_period(start_date: date | str | None,
@@ -170,16 +195,28 @@ def _parse_publications(payload: dict) -> list[dict]:
 
 def publication_agent(query: str, limit: int,
                       start_date: date | str | None = None,
-                      end_date: date | str | None = None) -> PublicationsResult:
+                      end_date: date | str | None = None,
+                      intervention: str = '',
+                      publication_type: str = 'all') -> PublicationsResult:
     """Try full metadata, then lightweight metadata, then a real local snapshot.
 
     The cache contains only previously successful responses from Europe PMC.
     It never fabricates publications and never silently presents cached data as live.
     """
     start, end = _normalize_period(start_date, end_date)
-    # Limit the *primary* search by first publication date. The effective query
-    # also keys the cache, so different date ranges never share snapshots.
-    effective_query = f'({query}) AND FIRST_PDATE:[{start} TO {end}]' if start else query
+    if publication_type not in PUBLICATION_TYPE_QUERIES:
+        raise ValueError('Неизвестный тип научной публикации.')
+    phrase = _intervention_phrase(intervention)
+    # All filters are part of the API query, before pageSize. The cache key
+    # includes the fully assembled query: different filters cannot collide.
+    clauses = [f'({query})']
+    if phrase:
+        clauses.append(phrase)
+    if PUBLICATION_TYPE_QUERIES[publication_type]:
+        clauses.append(PUBLICATION_TYPE_QUERIES[publication_type])
+    if start:
+        clauses.append(f'FIRST_PDATE:[{start} TO {end}]')
+    effective_query = ' AND '.join(clauses) if len(clauses) > 1 else query
     failure: Exception | None = None
     payload = None
     mode = 'core'
@@ -225,17 +262,40 @@ def publication_agent(query: str, limit: int,
 def trial_agent(query: str, limit: int,
                 start_date: date | str | None = None,
                 end_date: date | str | None = None,
-                trial_date_field: str = 'StartDate') -> list[dict]:
+                trial_date_field: str = 'StartDate',
+                intervention: str = '',
+                trial_status: str = '',
+                trial_phase: str = '',
+                results_filter: str = 'all') -> list[dict]:
     start, end = _normalize_period(start_date, end_date)
     if trial_date_field not in TRIAL_DATE_FIELDS:
         raise ValueError('Неизвестное поле даты для ClinicalTrials.gov.')
+    if trial_status and trial_status not in TRIAL_STATUSES:
+        raise ValueError('Неизвестный статус клинического испытания.')
+    if trial_phase and trial_phase not in TRIAL_PHASES:
+        raise ValueError('Неизвестная фаза клинического испытания.')
+    if results_filter not in RESULTS_FILTERS:
+        raise ValueError('Неизвестный фильтр наличия результатов.')
+    _intervention_phrase(intervention)  # validate before calling external API
     params = {
         'query.term': query, 'pageSize': limit, 'format': 'json',
         'countTotal': 'true',
     }
+    if intervention.strip():
+        params['query.intr'] = intervention.strip()
+    if trial_status:
+        params['filter.overallStatus'] = trial_status
+    # Phase, dates and posted results all use the API's advanced query.
+    # Combining in one parameter avoids one criterion silently replacing another.
+    advanced = []
     if start:
-        # Filter on the server, before the pageSize limit is applied.
-        params['filter.advanced'] = f'AREA[{trial_date_field}]RANGE[{start},{end}]'
+        advanced.append(f'AREA[{trial_date_field}]RANGE[{start},{end}]')
+    if trial_phase:
+        advanced.append(f'AREA[Phase]{trial_phase}')
+    if results_filter != 'all':
+        advanced.append(f'AREA[HasResults]{"true" if results_filter == "with" else "false"}')
+    if advanced:
+        params['filter.advanced'] = ' AND '.join(advanced)
     payload = _get_json(TRIALS_URL, params)
     results = []
     for item in payload.get('studies', []):
@@ -245,6 +305,9 @@ def trial_agent(query: str, limit: int,
         design = p.get('designModule') or {}
         desc = p.get('descriptionModule') or {}
         conditions = (p.get('conditionsModule') or {}).get('conditions') or []
+        intervention_items = (p.get('armsInterventionsModule') or {}).get('interventions') or []
+        interventions = ', '.join(_plain(value.get('name')) for value in intervention_items
+                                  if isinstance(value, dict) and value.get('name'))
         nct = ident.get('nctId', '')
         raw_references = (p.get('referencesModule') or {}).get('references') or []
         references = []
@@ -268,6 +331,7 @@ def trial_agent(query: str, limit: int,
             'start_date': (status.get('startDateStruct') or {}).get('date', ''),
             'first_posted_date': (status.get('studyFirstPostDateStruct') or {}).get('date', ''),
             'conditions': ', '.join(conditions),
+            'interventions': interventions,
             'summary': _plain(desc.get('briefSummary')),
             'has_results': bool(item.get('hasResults')),
             'url': f'https://clinicaltrials.gov/study/{nct}' if nct else '',
@@ -463,12 +527,26 @@ def related_publication_agent(trials: list[dict], current_publications: list[dic
 def coordinator(query: str, limit: int = 20,
                 start_date: date | str | None = None,
                 end_date: date | str | None = None,
-                trial_date_field: str = 'StartDate') -> dict:
+                trial_date_field: str = 'StartDate',
+                intervention: str = '',
+                trial_status: str = '',
+                trial_phase: str = '',
+                results_filter: str = 'all',
+                publication_type: str = 'all') -> dict:
     start, end = _normalize_period(start_date, end_date)
     if trial_date_field not in TRIAL_DATE_FIELDS:
         raise ValueError('Неизвестное поле даты для ClinicalTrials.gov.')
     if not query.strip():
         raise ValueError('Введите тему исследования')
+    if trial_status and trial_status not in TRIAL_STATUSES:
+        raise ValueError('Неизвестный статус клинического испытания.')
+    if trial_phase and trial_phase not in TRIAL_PHASES:
+        raise ValueError('Неизвестная фаза клинического испытания.')
+    if results_filter not in RESULTS_FILTERS:
+        raise ValueError('Неизвестный фильтр наличия результатов.')
+    if publication_type not in PUBLICATION_TYPE_QUERIES:
+        raise ValueError('Неизвестный тип научной публикации.')
+    _intervention_phrase(intervention)
     limit = max(1, min(100, int(limit)))
     results: dict[str, list[dict]] = {'Europe PMC': [], 'ClinicalTrials.gov': []}
     errors: dict[str, str] = {}
@@ -476,8 +554,11 @@ def coordinator(query: str, limit: int = 20,
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         futures = {
-            'Europe PMC': pool.submit(publication_agent, query.strip(), limit, start, end),
-            'ClinicalTrials.gov': pool.submit(trial_agent, query.strip(), limit, start, end, trial_date_field),
+            'Europe PMC': pool.submit(publication_agent, query.strip(), limit, start, end,
+                                      intervention, publication_type),
+            'ClinicalTrials.gov': pool.submit(trial_agent, query.strip(), limit, start, end,
+                                              trial_date_field, intervention, trial_status,
+                                              trial_phase, results_filter),
         }
         for name, future in futures.items():
             try:
@@ -494,7 +575,9 @@ def coordinator(query: str, limit: int = 20,
             except (requests.RequestException, ValueError, KeyError, TypeError, OSError) as exc:
                 errors[name] = _concise_error(exc)
     linked = []
-    if results['Europe PMC'] and results['ClinicalTrials.gov']:
+    # Trial references remain useful even if the primary publication query has
+    # zero matches (e.g. a narrow publication-type filter).
+    if results['ClinicalTrials.gov']:
         try:
             extra = related_publication_agent(results['ClinicalTrials.gov'], results['Europe PMC'])
             if extra is not None:
@@ -514,7 +597,26 @@ def coordinator(query: str, limit: int = 20,
         'start_date': start,
         'end_date': end,
         'trial_date_field': trial_date_field,
+        'intervention': intervention.strip(),
+        'trial_status': trial_status,
+        'trial_phase': trial_phase,
+        'results_filter': results_filter,
+        'publication_type': publication_type,
     }
+    if intervention.strip():
+        report['limitations'].append(
+            'Препарат/метод ищется в тексте Europe PMC и отдельно в поле вмешательств ClinicalTrials.gov; '
+            'результаты двух источников могут отличаться.'
+        )
+    if publication_type != 'all':
+        report['limitations'].append(
+            'Тип публикации определяется индексом Europe PMC, а не классификацией ClinicalTrials.gov.'
+        )
+    if any((trial_status, trial_phase, results_filter != 'all')):
+        report['limitations'].append(
+            'Статус, фаза и наличие результатов ограничивают только испытания ClinicalTrials.gov. '
+            'Дополнительные публикации по PMID используются только для поиска связей.'
+        )
     if start:
         report['limitations'].append(
             'Публикации отфильтрованы по дате первого выхода, испытания — по выбранному полю даты. '
